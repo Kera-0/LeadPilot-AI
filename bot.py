@@ -1,140 +1,123 @@
-"""LeadPilot: минимальный сценарный Telegram-продавец. Python 3.12+."""
+"""CLI / Telegram entry point. Web: python -m uvicorn leadpilot.app:app."""
 import argparse
 import json
-import os
-from pathlib import Path
-import sqlite3
 import time
-import urllib.request
-
-ROOT = Path(__file__).resolve().parent
-QUESTIONS = [
-    ('goal', 'Какая у вас цель?', ['Для работы', 'Для себя', 'Для ребёнка']),
-    ('problem', 'Что сейчас мешает достичь этой цели?', ['Нет знаний', 'Нет практики', 'Не хватает времени']),
-    ('level', 'Какой у вас опыт?', ['С нуля', 'Есть основы', 'Продвинутый']),
-    ('timing', 'Когда хотите начать?', ['На этой неделе', 'В течение месяца', 'Пока изучаю']),
-    ('format', 'Какой формат удобнее?', ['Онлайн', 'Очно', 'Нужен совет']),
-    ('budget', 'Какой бюджет рассматриваете? Можно написать сумму.', ['Нужен подбор', 'Обсужу с менеджером']),
-    ('decision', 'Кто принимает решение об оплате?', ['Я', 'Родитель', 'Решаем вместе']),
-]
+import uuid
+import httpx
+from leadpilot.config import ROOT, env
+from leadpilot.llm import ModelUnavailable
+from leadpilot.service import Service
+from leadpilot.store import Store
 
 
-class SalesBot:
-    def __init__(self, db='leads.db', catalog=None):
-        self.db = sqlite3.connect(db)
-        self.db.execute('CREATE TABLE IF NOT EXISTS leads (id INTEGER PRIMARY KEY, state TEXT)')
-        self.catalog = catalog if catalog is not None else json.loads((ROOT / 'catalog.json').read_text(encoding='utf-8'))['products']
+def telegram(method, **payload):
+    result = httpx.post(f'https://api.telegram.org/bot{env("TELEGRAM_BOT_TOKEN")}/{method}',
+                        json=payload, timeout=35)
+    result.raise_for_status()
+    body = result.json()
+    if not body.get('ok'):
+        raise RuntimeError('Telegram request failed')
+    return body['result']
 
-    def save(self, uid, state):
-        with self.db:
-            self.db.execute('INSERT OR REPLACE INTO leads VALUES (?, ?)', (uid, json.dumps(state, ensure_ascii=False)))
 
-    def handle(self, uid, message):
-        row = self.db.execute('SELECT state FROM leads WHERE id=?', (uid,)).fetchone()
-        s = json.loads(row[0]) if row else {'step': -1, 'answers': {}, 'history': [], 'status': 'new'}
-        text = message.strip()[:3000]
-        low = text.lower()
-        if low == '/delete':
-            with self.db:
-                self.db.execute('DELETE FROM leads WHERE id=?', (uid,))
-            return 'Данные из локальной базы удалены. Для начала: /start', [], None
-        handoff = None
-        if low in ('/stop', 'стоп', 'отписаться'):
-            s['status'] = 'stopped'
-            reply, buttons = 'Общение остановлено. Вернуться: /start. Удалить данные: /delete.', []
-        elif s['status'] == 'stopped' and low != '/start':
-            return 'Общение остановлено. Вернуться: /start.', [], None
-        elif low == '/start' or (s['step'] == -1 and low != 'согласен'):
-            s['step'] = -1
-            s['status'] = 'new'
-            reply = ('Здравствуйте! Я автоматический ассистент LeadPilot. Помогу подобрать обучение.\n'
-                     'С вашего согласия сохраним Telegram ID, ответы и переписку в локальной базе оператора '
-                     'и передадим заявку менеджеру. /delete — удалить локальные данные; /stop — остановить. Продолжить?')
-            buttons = ['Согласен', 'Стоп']
-            if row:
-                self.save(uid, s)
-            return reply, buttons, None
-        elif s['step'] == -1:
-            s['status'] = 'qualifying'
-            s['step'] = 0
-            reply, buttons = QUESTIONS[0][1:]
-        elif any(word in low for word in ('менеджер', 'человек', 'возврат', 'жалоб', 'конфликт')):
-            s['status'] = 'handoff'
-            handoff = f'Заявка {uid}\n' + json.dumps(s['answers'], ensure_ascii=False) + '\nПереписка:\n' + '\n'.join(s['history'] + ['Клиент: ' + text])
-            reply, buttons = 'Заявка сохранена для менеджера. Он сможет продолжить с учётом ваших ответов.', []
-        elif s['status'] == 'handoff':
-            reply, buttons = 'Заявка ожидает менеджера. Дополнение сохранено. Начать заново: /start.', []
-        elif s['step'] < len(QUESTIONS):
-            s['answers'][QUESTIONS[s['step']][0]] = text
-            s['step'] += 1
-            if s['step'] < len(QUESTIONS):
-                reply, buttons = QUESTIONS[s['step']][1:]
-            else:
-                matches = [p for p in self.catalog if p.get('goal') == s['answers']['goal']]
-                if matches:
-                    p = matches[0]
-                    reply = f"Под вашу цель есть вариант: {p['name']}.\n{p['description']}\nЦена: {p['price']}.\nОбсудим детали с менеджером?"
-                else:
-                    reply = 'Спасибо! Ответы сохранены. В базе пока нет подтверждённого предложения под вашу цель. Передать заявку менеджеру?'
-                buttons = ['Менеджер', 'Стоп']
+def notifications(service):
+    if not env('TELEGRAM_BOT_TOKEN') or not env('MANAGER_CHAT_ID'):
+        return
+    store = service.store
+    with store.lock:
+        pending = list(store.db.execute('SELECT * FROM notifications WHERE delivered IS NULL AND available<=? LIMIT 10', (time.time(),)))
+    for row in pending:
+        try:
+            telegram('sendMessage', chat_id=env('MANAGER_CHAT_ID'), text=row['text'])
+        except (httpx.HTTPError, RuntimeError):
+            with store.lock, store.db:
+                store.db.execute('UPDATE notifications SET attempts=attempts+1,available=? WHERE id=?',
+                                 (time.time() + min(3600, 5 * 2 ** min(row['attempts'], 9)), row['id']))
         else:
-            reply, buttons = 'Этот вопрос лучше уточнить у менеджера. Передать заявку?', ['Менеджер', 'Стоп']
-        s['history'].extend(['Клиент: ' + text, 'Бот: ' + reply])
-        self.save(uid, s)
-        return reply, buttons, handoff
+            with store.lock, store.db:
+                store.db.execute('UPDATE notifications SET delivered=? WHERE id=?', (time.time(), row['id']))
 
 
-def api(token, method, **data):
-    request = urllib.request.Request(f'https://api.telegram.org/bot{token}/{method}',
-                                     data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(request, timeout=40) as response:
-        result = json.load(response)
-    if not result.get('ok'):
-        raise RuntimeError('Telegram API rejected request')
-    return result['result']
+def voice_text(service, cid, voice):
+    with service.store.lock:
+        client = service.store.client(cid)
+        if not client or client['state']['status'] in ('new', 'stopped'):
+            return None
+    if voice.get('file_size', 0) > 10 * 1024 * 1024:
+        return None
+    info = telegram('getFile', file_id=voice['file_id'])
+    if info.get('file_size', 0) > 10 * 1024 * 1024:
+        return None
+    with httpx.stream('GET', f'https://api.telegram.org/file/bot{env("TELEGRAM_BOT_TOKEN")}/{info["file_path"]}', timeout=20) as response:
+        response.raise_for_status()
+        chunks, total = [], 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > 10 * 1024 * 1024:
+                return None
+            chunks.append(chunk)
+    return service.model.transcribe(b''.join(chunks))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--demo', action='store_true', help='Локальный диалог без Telegram')
+    parser.add_argument('--demo', action='store_true', help='Живой LLM-диалог в терминале')
+    parser.add_argument('--worker', action='store_true', help='Только очередь уведомлений менеджеру')
     args = parser.parse_args()
-    bot = SalesBot(str(ROOT / 'leads.db'))
+    service = Service(Store(env('DATABASE_PATH', str(ROOT / 'leads.db'))))
+    service.cleanup()
     if args.demo:
-        print('Введите /start. Выход: /quit')
+        print('LeadPilot / живой LLM. /start — начать, /quit — выход.')
         while True:
-            msg = input('Вы: ')
-            if msg == '/quit':
-                break
-            reply, buttons, _ = bot.handle(1, msg)
-            print(reply, '\nВарианты:', ', '.join(buttons))
-        return
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    manager = os.environ.get('MANAGER_CHAT_ID')
-    if not token or not manager:
-        parser.error('Задайте TELEGRAM_BOT_TOKEN и MANAGER_CHAT_ID или используйте --demo')
-    offset = 0
-    print('LeadPilot запущен. Ctrl+C — остановить.')
+            text = input('Вы: ')
+            if text == '/quit':
+                return
+            result = service.handle('cli:demo', text, str(uuid.uuid4()), 'cli')
+            print(result['text'], '\nВарианты:', ', '.join(result['buttons']))
+    if not env('TELEGRAM_BOT_TOKEN') or not env('MANAGER_CHAT_ID'):
+        parser.error('Задайте TELEGRAM_BOT_TOKEN и MANAGER_CHAT_ID или используйте --demo; веб: python -m uvicorn leadpilot.app:app')
+    print('LeadPilot Telegram запущен. Ctrl+C — остановить.')
+    last_cleanup = 0
     while True:
         try:
-            for update in api(token, 'getUpdates', offset=offset, timeout=25, allowed_updates=['message']):
-                msg = update.get('message', {})
-                chat = msg.get('chat', {})
-                if chat.get('type') == 'private':
-                    uid = chat['id']
-                    if not msg.get('text'):
-                        api(token, 'sendMessage', chat_id=uid, text='Пока понимаю только текст. Напишите сообщение или «Менеджер».')
+            notifications(service)
+            if time.time() - last_cleanup > 3600:
+                service.cleanup()
+                last_cleanup = time.time()
+            if args.worker:
+                time.sleep(3)
+                continue
+            with service.store.lock:
+                row = service.store.db.execute("SELECT value FROM settings WHERE key='telegram_offset'").fetchone()
+            offset = int(row['value']) if row else 0
+            for update in telegram('getUpdates', offset=offset, timeout=25, allowed_updates=['message']):
+                message = update.get('message', {})
+                chat = message.get('chat', {})
+                if chat.get('type') == 'private' and str(chat['id']) != env('MANAGER_CHAT_ID'):
+                    cid = f'telegram:{chat["id"]}'
+                    text = message.get('text', '')
+                    if message.get('voice'):
+                        try:
+                            text = voice_text(service, cid, message['voice']) or ''
+                        except ModelUnavailable:
+                            text = ''
+                    if text:
+                        result = service.handle(cid, text[:3000], f'tg_{update["update_id"]}', 'telegram', str(chat['id']))
+                        buttons = result['buttons']
+                        telegram('sendMessage', chat_id=chat['id'], text=result['text'], reply_markup={
+                            'keyboard': [[{'text': b}] for b in buttons], 'resize_keyboard': True
+                        } if buttons else {'remove_keyboard': True})
                     else:
-                        reply, buttons, handoff = bot.handle(uid, msg['text'])
-                        if handoff:
-                            for start in range(0, len(handoff), 4000):
-                                api(token, 'sendMessage', chat_id=manager, text=handoff[start:start + 4000])
-                        api(token, 'sendMessage', chat_id=uid, text=reply,
-                            reply_markup={'keyboard': [[{'text': b}] for b in buttons], 'resize_keyboard': True} if buttons else {'remove_keyboard': True})
-                offset = update['update_id'] + 1
-        except (OSError, RuntimeError):
-            print('Ошибка связи с Telegram. Повтор через 5 секунд; токен не выводится.')
+                        telegram('sendMessage', chat_id=chat['id'], text='Напишите текстом. Голос доступен после согласия при настроенной модели; лимит 10 МБ. Начать: /start.')
+                with service.store.lock, service.store.db:
+                    service.store.db.execute("INSERT OR REPLACE INTO settings VALUES('telegram_offset',?)", (str(update['update_id'] + 1),))
+        except (httpx.HTTPError, RuntimeError):
+            print('Временная ошибка Telegram. Повтор через 5 секунд; секреты не выводятся.')
             time.sleep(5)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\nОстановлено.')
